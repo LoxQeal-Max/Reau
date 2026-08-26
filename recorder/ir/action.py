@@ -10,6 +10,11 @@ class TargetKind(str, Enum):
     UIA = "uia"
 
 
+class ActionType(str, Enum):
+    TOUCH = "touch"
+    SWIPE = "swipe"
+
+
 @dataclass
 class Action:
     type: str

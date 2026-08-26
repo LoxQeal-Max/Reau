@@ -111,7 +111,7 @@ def _cli_record(seconds: int | None, serial: str):
     actions = rec.stop()
     print(f"共 {len(actions)} 条 action", flush=True)
     for a in actions:
-        asm.append(asm.codegen.emit(a))
+        asm.append(asm.codegen.emit(a), timestamp=a.timestamp)
 
     script_path = asm.build()
     print(f"\n脚本已生成: {script_path}", flush=True)

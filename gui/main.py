@@ -87,11 +87,14 @@ class RecorderApp:
         frame = ttk.Frame(self.root, padding=(10, 8))
         frame.pack(fill="x")
 
+        self.refresh_btn = ttk.Button(frame, text="刷新", command=self._refresh_device)
+        self.refresh_btn.pack(side="right", padx=4)
+
         ttk.Label(frame, text="设备:").pack(side="left", padx=(0, 6))
         self.device_var = tk.StringVar(value="检测中...")
-        ttk.Label(frame, textvariable=self.device_var, foreground="gray").pack(side="left")
-
-        ttk.Button(frame, text="刷新", command=self._refresh_device).pack(side="right", padx=4)
+        self.device_label = ttk.Label(frame, textvariable=self.device_var, foreground="gray",
+                                      anchor="w", width=50)
+        self.device_label.pack(side="left", fill="x", expand=True)
 
         sep = ttk.Separator(self.root, orient="horizontal")
         sep.pack(fill="x", padx=10)

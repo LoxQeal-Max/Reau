@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.pkg
+
+# Test logs and temp files
+test_*.py
+test_*.txt
+diag_*.py
+diag_*.txt
+ui_dump.xml
+test_ui_*.xml
+
+# Output
+out/

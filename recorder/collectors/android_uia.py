@@ -1,0 +1,368 @@
+"""Android 采集器：uiautomator2 + getevent 混合方案
+
+  1. uiautomator2 (HTTP 端口转发) → dump UI 树，每 0.5s 刷新
+  2. adb exec-out getevent -l → 监听触摸事件（独立 ADB 通道，不冲突）
+  3. 坐标匹配 UI 控件 → 生成选择器优先 + 坐标兜底的 Action
+"""
+from __future__ import annotations
+import re
+import time
+import threading
+import subprocess
+import xml.etree.ElementTree as ET
+from typing import Optional
+
+from .base import BaseCollector
+from ..ir.action import Action, TargetKind
+
+
+_EV_LINE = re.compile(
+    r"(?:\[[\s\d.]+\]\s*)?(/dev/input/event\d+):\s+(EV_ABS|EV_SYN|EV_KEY)\s+(\S+)\s+(.+)$")
+
+_LABEL_MAP = {"DOWN": 1, "UP": 0, "PRESSED": 1, "RELEASED": 0, "TRUE": 1, "FALSE": 0}
+
+def _parse_value(token: str) -> int:
+    token = token.strip()
+    if token in _LABEL_MAP:
+        return _LABEL_MAP[token]
+    try:
+        return int(token, 16)
+    except ValueError:
+        try:
+            return int(token)
+        except ValueError:
+            return 0
+
+
+class AndroidUiaCollector(BaseCollector):
+    def __init__(self, on_event=None, device_serial: str = "", adb_path: str = "", **_):
+        super().__init__(on_event)
+        self.device_serial = device_serial
+        self.adb_path = adb_path or self._find_adb()
+        self._proc: Optional[subprocess.Popen] = None
+        self._ge_thread: Optional[threading.Thread] = None
+        self._ui_thread: Optional[threading.Thread] = None
+        self._d = None
+        self._xmin = self._xmax = self._ymin = self._ymax = None
+        self._screen_w = self._screen_h = 0
+        self._touch_devices: set = set()
+        self._pending_x: Optional[int] = None
+        self._pending_y: Optional[int] = None
+        self._last_emit_ts = 0.0
+        self._ui_cache: list[dict] = []
+        self._ui_cache_lock = threading.Lock()
+        self._ui_cache_ts = 0.0
+
+    @staticmethod
+    def _find_adb():
+        import os
+        candidates = []
+        try:
+            from airtest.core.android.adb import ADB
+            candidates.append(ADB().adb_path)
+        except Exception:
+            pass
+        try:
+            import airtest.core.android.adb as mod
+            pkg_dir = os.path.dirname(mod.__file__)
+            candidates.append(os.path.join(pkg_dir, "static", "adb", "windows", "adb.exe"))
+            candidates.append(os.path.join(pkg_dir, "static", "adb", "mac", "adb"))
+            candidates.append(os.path.join(pkg_dir, "static", "adb", "linux", "adb"))
+        except Exception:
+            pass
+        try:
+            import uiautomator2 as u2
+            pkg = os.path.dirname(u2.__file__)
+            for root, dirs, files in os.walk(pkg):
+                for f in files:
+                    if f == "adb.exe":
+                        candidates.append(os.path.join(root, f))
+        except Exception:
+            pass
+        candidates.append("adb")
+        for p in candidates:
+            if p == "adb":
+                return p
+            if os.path.exists(p):
+                return p
+        return "adb"
+
+    def _adb_base(self) -> list[str]:
+        cmd = [self.adb_path]
+        if self.device_serial:
+            cmd += ["-s", self.device_serial]
+        return cmd
+
+    def _adb_run(self, args: list, timeout: int = 10) -> Optional[str]:
+        try:
+            r = subprocess.run(
+                self._adb_base() + args,
+                capture_output=True, text=True,
+                encoding="utf-8", errors="ignore", timeout=timeout)
+            return r.stdout
+        except Exception:
+            return None
+
+    # ---------- 生命周期 ----------
+    def start(self, on_event):
+        self.on_event = on_event
+        self.running = True
+        self._init_uiautomator2()
+        self._init_scale()
+        self._ui_thread = threading.Thread(target=self._ui_cache_loop, daemon=True)
+        self._ui_thread.start()
+        self._ge_thread = threading.Thread(target=self._getevent_loop, daemon=True)
+        self._ge_thread.start()
+
+    def _init_uiautomator2(self):
+        import uiautomator2 as u2
+        try:
+            if self.device_serial:
+                self._d = u2.connect(self.device_serial)
+            else:
+                self._d = u2.connect()
+            info = self._d.info
+            self._screen_w = info.get("displayWidth", 1080)
+            self._screen_h = info.get("displayHeight", 2520)
+            model = info.get("productName", "unknown")
+            print(f"[android] 设备: {model} 屏[{self._screen_w}x{self._screen_h}]", flush=True)
+        except Exception as e:
+            print(f"[android] uiautomator2 连接失败: {e}", flush=True)
+            self._screen_w = 1080
+            self._screen_h = 2520
+
+    def _init_scale(self):
+        try:
+            out = self._adb_run(["shell", "getevent", "-lp"], timeout=5) or ""
+            cur_dev = None
+            best_xmax = -1
+            for line in out.splitlines():
+                low = line.lower()
+                m_dev = re.match(r"\s*add device\s+\d+:\s*(/dev/input/event\d+)", low)
+                if m_dev:
+                    cur_dev = m_dev.group(1)
+                    continue
+                if cur_dev and "abs_mt_position_x" in low:
+                    self._touch_devices.add(cur_dev)
+                    m = re.search(r"min\s+(-?\d+)\s*,?\s*max\s+(-?\d+)", low)
+                    if m:
+                        xmax = int(m.group(2))
+                        if xmax > best_xmax:
+                            best_xmax = xmax
+                            self._xmin, self._xmax = int(m.group(1)), xmax
+                elif cur_dev and "abs_mt_position_y" in low:
+                    m = re.search(r"min\s+(-?\d+)\s*,?\s*max\s+(-?\d+)", low)
+                    if m and self._xmax == best_xmax:
+                        self._ymin, self._ymax = int(m.group(1)), int(m.group(2))
+            if self._touch_devices:
+                print(f"[android] 触摸屏: {self._touch_devices} "
+                      f"X[{self._xmin},{self._xmax}] Y[{self._ymin},{self._ymax}]", flush=True)
+        except Exception as e:
+            print(f"[android] _init_scale 异常: {e}", flush=True)
+
+    def _scale(self, raw_x: int, raw_y: int):
+        sx = float(raw_x)
+        sy = float(raw_y)
+        if self._xmax and self._xmax != self._screen_w:
+            sx = raw_x * self._screen_w / self._xmax
+        if self._ymax and self._ymax != self._screen_h:
+            sy = raw_y * self._screen_h / self._ymax
+        return int(round(sx)), int(round(sy))
+
+    # ---------- UI 树缓存线程 (uiautomator2) ----------
+    def _ui_cache_loop(self):
+        print("[android] UI 树缓存线程启动 (uiautomator2)", flush=True)
+        while self.running:
+            try:
+                if self._d:
+                    xml_str = self._d.dump_hierarchy()
+                    if xml_str:
+                        cache = self._parse_ui_xml(xml_str)
+                        with self._ui_cache_lock:
+                            self._ui_cache = cache
+                            self._ui_cache_ts = time.time()
+            except Exception as e:
+                pass
+            if not self.running:
+                break
+            time.sleep(0.5)
+        print("[android] UI 树缓存线程停止", flush=True)
+
+    def _parse_ui_xml(self, xml_str: str) -> list[dict]:
+        cache = []
+        try:
+            root = ET.fromstring(xml_str)
+            self._walk_xml(root, cache)
+        except Exception:
+            pass
+        return cache
+
+    def _walk_xml(self, node: ET.Element, out: list):
+        bounds_str = node.get("bounds", "")
+        text = node.get("text", "")
+        rid = node.get("resource-id", "")
+        cls = node.get("class", "")
+        desc = node.get("content-desc", "")
+        if bounds_str:
+            try:
+                parts = bounds_str.replace("][", ",").replace("[", "").replace("]", "")
+                coords = [int(x) for x in parts.split(",")]
+                if len(coords) == 4:
+                    x1, y1, x2, y2 = coords
+                    out.append({
+                        "text": text,
+                        "resource_id": rid,
+                        "class": cls,
+                        "content_desc": desc,
+                        "bounds": (x1, y1, x2, y2),
+                    })
+            except Exception:
+                pass
+        for child in node:
+            self._walk_xml(child, out)
+
+    def _find_node_at(self, x: int, y: int) -> Optional[dict]:
+        with self._ui_cache_lock:
+            cache = list(self._ui_cache)
+        if not cache:
+            return None
+        best = None
+        best_area = float("inf")
+        for item in cache:
+            x1, y1, x2, y2 = item["bounds"]
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                area = (x2 - x1) * (y2 - y1)
+                if area < best_area:
+                    best_area = area
+                    best = item
+        return best
+
+    # ---------- getevent 监听线程 ----------
+    def _getevent_loop(self):
+        try:
+            self._getevent_loop_impl()
+        except Exception as e:
+            print(f"[android] getevent 异常: {e}", flush=True)
+
+    def _getevent_loop_impl(self):
+        cmd = self._adb_base() + ["exec-out", "getevent", "-l"]
+        print(f"[android] 启动 getevent (exec-out): {' '.join(cmd)}", flush=True)
+        try:
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                bufsize=0)
+        except FileNotFoundError:
+            print("[android] 找不到 adb", flush=True)
+            return
+        print("[android] getevent 已启动，等待触摸...", flush=True)
+        buf = b""
+        line_count = 0
+        while self.running:
+            chunk = self._proc.stdout.read(4096)
+            if not chunk:
+                if self._proc.poll() is not None:
+                    break
+                continue
+            buf += chunk
+            while b"\n" in buf:
+                line_bytes, buf = buf.split(b"\n", 1)
+                try:
+                    line = line_bytes.decode("utf-8", errors="ignore").rstrip("\r")
+                except Exception:
+                    continue
+                if line:
+                    line_count += 1
+                    if line_count <= 5 or line_count % 50 == 0:
+                        print(f"[android] GE #{line_count}: {line}", flush=True)
+                    self._handle_line(line)
+        try:
+            self._proc.wait(timeout=2)
+        except Exception:
+            pass
+
+    def _handle_line(self, line: str):
+        m = _EV_LINE.match(line)
+        if not m:
+            print(f"[android] NO MATCH: {line}", flush=True)
+            return
+        dev_path, evtype, code, raw_val = m.groups()
+        if self._touch_devices and dev_path not in self._touch_devices:
+            print(f"[android] FILTERED dev={dev_path} not in {self._touch_devices}", flush=True)
+            return
+        val = _parse_value(raw_val)
+        if evtype == "EV_ABS":
+            if code == "ABS_MT_TRACKING_ID":
+                if val >= 0x80000000 or val == -1:
+                    self._flush_touch()
+            elif code == "ABS_MT_POSITION_X":
+                self._pending_x = val
+            elif code == "ABS_MT_POSITION_Y":
+                self._pending_y = val
+        elif evtype == "EV_KEY":
+            if code == "BTN_TOUCH" and val == 0:
+                self._flush_touch()
+
+    def _flush_touch(self):
+        x, y = self._pending_x, self._pending_y
+        if x is None or y is None:
+            print(f"[android] flush SKIP: x={x} y={y}", flush=True)
+            return
+        now = time.time()
+        if now - self._last_emit_ts < 0.3:
+            self._pending_x = self._pending_y = None
+            print(f"[android] flush THROTTLE", flush=True)
+            return
+        sx, sy = self._scale(x, y)
+        if self._screen_w and (sx < 0 or sx > self._screen_w or sy < 0 or sy > self._screen_h):
+            self._pending_x = self._pending_y = None
+            print(f"[android] flush OUT_OF_BOUNDS: ({sx},{sy})", flush=True)
+            return
+
+        node = self._find_node_at(sx, sy)
+        uia_attrs = {}
+        if node:
+            if node.get("text"):
+                uia_attrs["text"] = node["text"]
+            elif node.get("resource_id"):
+                rid = node["resource_id"]
+                short_rid = rid.split(":id/")[-1] if ":id/" in rid else rid
+                uia_attrs["resourceId"] = short_rid
+            elif node.get("content_desc"):
+                uia_attrs["contentDesc"] = node["content_desc"]
+            elif node.get("class"):
+                uia_attrs["className"] = node["class"]
+
+        kind_desc = "UIA" if uia_attrs else "坐标"
+        print(f"[android] 录制: ({sx},{sy}) {kind_desc} attrs={uia_attrs or '无'}", flush=True)
+
+        self.emit(Action(
+            type="touch",
+            target={"kind": TargetKind.COORD, "value": (sx, sy)},
+            platform="android",
+            timestamp=now,
+            params={"uia": uia_attrs, "element": node or {}},
+        ))
+        self._last_emit_ts = now
+        self._pending_x = self._pending_y = None
+
+    # ---------- 停止 ----------
+    def stop(self):
+        self.running = False
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+        if self._ge_thread:
+            self._ge_thread.join(timeout=3)
+        if self._ui_thread:
+            self._ui_thread.join(timeout=3)
+        if self._d:
+            try:
+                self._d.disconnect()
+            except Exception:
+                pass
+
+    def snapshot(self) -> dict:
+        return {"screen": {"width": self._screen_w, "height": self._screen_h},
+                "ui_cache_size": len(self._ui_cache)}

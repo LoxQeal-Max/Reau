@@ -35,7 +35,10 @@ def _parse_value(token: str) -> int:
 
 
 class AndroidUiaCollector(BaseCollector):
-    def __init__(self, on_event=None, device_serial: str = "", adb_path: str = "", **_):
+    def __init__(self, on_event=None, device_serial: str = "", adb_path: str = "",
+                 enable_screenshot: bool = False, screenshot_dir: str = "out/screenshots",
+                 enable_template: bool = False, template_dir: str = "out/templates",
+                 template_size: int = 80, **_):
         super().__init__(on_event)
         self.device_serial = device_serial
         self.adb_path = adb_path or self._find_adb()
@@ -52,6 +55,13 @@ class AndroidUiaCollector(BaseCollector):
         self._ui_cache: list[dict] = []
         self._ui_cache_lock = threading.Lock()
         self._ui_cache_ts = 0.0
+        self._enable_screenshot = enable_screenshot
+        self._screenshot_dir = screenshot_dir
+        self._shot_count = 0
+        self._enable_template = enable_template
+        self._template_dir = template_dir
+        self._template_size = template_size
+        self._template_count = 0
 
     @staticmethod
     def _find_adb():
@@ -335,15 +345,80 @@ class AndroidUiaCollector(BaseCollector):
         kind_desc = "UIA" if uia_attrs else "坐标"
         print(f"[android] 录制: ({sx},{sy}) {kind_desc} attrs={uia_attrs or '无'}", flush=True)
 
+        action_params = {"uia": uia_attrs, "element": node or {}}
+        shot_path = self._try_screenshot(sx, sy)
+        if shot_path:
+            action_params["screenshot"] = shot_path
+        template_path = self._try_template(sx, sy)
+        if template_path:
+            action_params["template"] = template_path
+
         self.emit(Action(
             type="touch",
             target={"kind": TargetKind.COORD, "value": (sx, sy)},
             platform="android",
             timestamp=now,
-            params={"uia": uia_attrs, "element": node or {}},
+            params=action_params,
         ))
         self._last_emit_ts = now
         self._pending_x = self._pending_y = None
+
+    # ---------- 可选截图 ----------
+    def _try_screenshot(self, click_x: int = 0, click_y: int = 0) -> Optional[str]:
+        if not self._enable_screenshot or self._d is None:
+            return None
+        try:
+            import os
+            from datetime import datetime
+            os.makedirs(self._screenshot_dir, exist_ok=True)
+            img = self._d.screenshot()
+            if hasattr(img, 'save'):
+                import io
+                buf = io.BytesIO()
+                img.save(buf, format='PNG')
+                data = buf.getvalue()
+            elif isinstance(img, bytes):
+                data = img
+            else:
+                return None
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            path = os.path.join(self._screenshot_dir, f"shot_{self._shot_count:04d}_{ts}.png")
+            with open(path, 'wb') as f:
+                f.write(data)
+            self._shot_count += 1
+            return path
+        except Exception as e:
+            print(f"[android] 截图失败: {e}", flush=True)
+            return None
+
+    # ---------- 可选模板裁剪 ----------
+    def _try_template(self, click_x: int, click_y: int) -> Optional[str]:
+        if not self._enable_template or self._d is None:
+            return None
+        try:
+            import os
+            import numpy as np
+            from datetime import datetime
+            os.makedirs(self._template_dir, exist_ok=True)
+            img = self._d.screenshot()
+            if not hasattr(img, 'save'):
+                return None
+            half = self._template_size // 2
+            x1 = max(0, click_x - half)
+            y1 = max(0, click_y - half)
+            x2 = min(self._screen_w, click_x + half)
+            y2 = min(self._screen_h, click_y + half)
+            if x2 - x1 < 10 or y2 - y1 < 10:
+                return None
+            cropped = img.crop((x1, y1, x2, y2))
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            path = os.path.join(self._template_dir, f"tpl_{self._template_count:04d}_{ts}.png")
+            cropped.save(path, 'PNG')
+            self._template_count += 1
+            return path
+        except Exception as e:
+            print(f"[android] 模板裁剪失败: {e}", flush=True)
+            return None
 
     # ---------- 停止 ----------
     def stop(self):

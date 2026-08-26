@@ -138,6 +138,7 @@ class RecorderApp:
         self.stop_btn = tk.Button(frame, text="■ 结束录制", command=self._stop_recording,
                                    width=14, bg="#c42b1c", fg="white",
                                    activebackground="#a52015", activeforeground="white",
+                                   disabledforeground="white",
                                    relief="flat", state="disabled")
         self.stop_btn.pack(side="left", padx=(0, 8))
 
@@ -149,7 +150,13 @@ class RecorderApp:
 
         self.clear_btn = tk.Button(frame, text="清空", command=self._clear_actions,
                                     width=8, relief="flat")
-        self.clear_btn.pack(side="left")
+        self.clear_btn.pack(side="left", padx=(0, 12))
+
+        self.screenshot_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="录制时截图", variable=self.screenshot_var).pack(side="left")
+
+        self.template_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="裁剪点击模板", variable=self.template_var).pack(side="left", padx=(8, 0))
 
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(frame, textvariable=self.status_var, foreground="gray").pack(side="right")
@@ -245,11 +252,18 @@ class RecorderApp:
             bus.subscribe("code", self._on_code)
 
             serial = self.device_var.get().split("(")[-1].rstrip(")") if "(" in self.device_var.get() else ""
-            self.rec.start("android", device_serial=serial)
+            enable_shot = self.screenshot_var.get()
+            enable_tpl = self.template_var.get()
+            self.rec.start("android", device_serial=serial,
+                          enable_screenshot=enable_shot, enable_template=enable_tpl)
             self.is_recording = True
 
+            parts = []
+            if enable_shot: parts.append("📷截图")
+            if enable_tpl: parts.append("🎯模板")
+            if not parts: parts.append("仅坐标")
             self.root.after(0, lambda: self.status_var.set("● 录制中..."))
-            self.root.after(0, lambda: self._log("=== 开始录制，请触摸屏幕 ===", "success"))
+            self.root.after(0, lambda: self._log(f"=== 开始录制，请触摸屏幕 ({' / '.join(parts)}) ===", "success"))
         except Exception as e:
             self.is_recording = False
             self.root.after(0, lambda: self.start_btn.configure(state="normal"))
@@ -290,8 +304,12 @@ class RecorderApp:
         val = tgt.get("value", "")
         uia = a.get("params", {}).get("uia") or {}
         matched = a.get("params", {}).get("element_def", "")
+        shot = a.get("params", {}).get("screenshot", "")
+        tpl = a.get("params", {}).get("template", "")
         tag = f" [{matched}]" if matched else ""
-        self._log(f"  {a.get('type', '?')} {val}{tag}", "action")
+        shot_tag = f" 📷" if shot else ""
+        tpl_tag = f" 🎯" if tpl else ""
+        self._log(f"  {a.get('type', '?')} {val}{tag}{shot_tag}{tpl_tag}", "action")
 
     def _on_code(self, c: dict):
         self._log(f"  → {c.get('code', '')}", "info")

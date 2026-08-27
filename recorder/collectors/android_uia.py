@@ -5,6 +5,7 @@
   3. 坐标匹配 UI 控件 → 生成选择器优先 + 坐标兜底的 Action
 """
 from __future__ import annotations
+import os
 import re
 import time
 import threading
@@ -36,9 +37,10 @@ def _parse_value(token: str) -> int:
 
 class AndroidUiaCollector(BaseCollector):
     def __init__(self, on_event=None, device_serial: str = "", adb_path: str = "",
-                 enable_screenshot: bool = False, screenshot_dir: str = "out/screenshots",
-                 enable_template: bool = False, template_dir: str = "out/templates",
-                 template_size: int = 120, swipe_threshold: int = 30, **_):
+                 enable_screenshot: bool = False, screenshot_dir: str = "",
+                 enable_template: bool = False, template_dir: str = "",
+                 template_size: int = 120, swipe_threshold: int = 30,
+                 session_dir: str = "", **_):
         super().__init__(on_event)
         self.device_serial = device_serial
         self.adb_path = adb_path or self._find_adb()
@@ -56,10 +58,10 @@ class AndroidUiaCollector(BaseCollector):
         self._ui_cache_lock = threading.Lock()
         self._ui_cache_ts = 0.0
         self._enable_screenshot = enable_screenshot
-        self._screenshot_dir = screenshot_dir
+        self._screenshot_dir = screenshot_dir or (os.path.join(session_dir, "screenshots") if session_dir else "out/screenshots")
         self._shot_count = 0
         self._enable_template = enable_template
-        self._template_dir = template_dir
+        self._template_dir = template_dir or (os.path.join(session_dir, "templates") if session_dir else "out/templates")
         self._template_size = template_size
         self._template_count = 0
         self._swipe_threshold = swipe_threshold
@@ -511,8 +513,12 @@ class AndroidUiaCollector(BaseCollector):
             path = os.path.join(self._template_dir, f"tpl_{self._template_count:04d}_{ts}.png")
             cropped.save(path, 'PNG')
             self._template_count += 1
+            try:
+                rel_path = os.path.relpath(path, os.getcwd())
+            except ValueError:
+                rel_path = path
             print(f"[android] 模板裁剪: ({click_x},{click_y}) 区域({x1},{y1})-({x2},{y2}) 尺寸{tpl_size}", flush=True)
-            return path
+            return rel_path
         except Exception as e:
             print(f"[android] 模板裁剪失败: {e}", flush=True)
             return None

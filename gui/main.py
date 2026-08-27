@@ -36,6 +36,7 @@ APP_TITLE = "录制自动化工具"
 APP_VERSION = "1.0.0"
 
 OUTPUT_DIR = "out"
+SESSIONS_DIR = os.path.join(OUTPUT_DIR, "sessions")
 SCRIPT_FILE = os.path.join(OUTPUT_DIR, "script.py")
 
 
@@ -264,6 +265,26 @@ class RecorderApp:
         self.template_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opt_frame, text="裁剪模板", variable=self.template_var).pack(side="left", padx=(6, 0))
 
+        # 会话历史选择
+        ttk.Label(opt_frame, text="|", style="Dim.TLabel").pack(side="left", padx=(12, 6))
+        ttk.Label(opt_frame, text="历史", style="Dim.TLabel").pack(side="left")
+        self.session_var = tk.StringVar()
+        self.session_combo = ttk.Combobox(opt_frame, textvariable=self.session_var,
+                                          width=30, state="readonly")
+        self.session_combo.pack(side="left", padx=(4, 0))
+        self._refresh_sessions()
+
+    def _refresh_sessions(self):
+        sessions = []
+        if os.path.exists(SESSIONS_DIR):
+            for d in sorted(os.listdir(SESSIONS_DIR), reverse=True):
+                path = os.path.join(SESSIONS_DIR, d)
+                if os.path.isdir(path) and os.path.exists(os.path.join(path, "script.py")):
+                    sessions.append(d)
+        self.session_combo["values"] = sessions
+        if sessions:
+            self.session_combo.set(sessions[0])
+
     # ---------- 设备 ----------
     def _refresh_device(self):
         self._log("正在检测设备...", "info")
@@ -348,7 +369,13 @@ class RecorderApp:
             self.current_actions = []
             self._clear_log()
 
-            self._asm = ScriptAssembler(OUTPUT_DIR)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            self.session_dir = os.path.abspath(os.path.join(SESSIONS_DIR, timestamp))
+            os.makedirs(self.session_dir, exist_ok=True)
+            os.makedirs(os.path.join(self.session_dir, "templates"), exist_ok=True)
+            os.makedirs(os.path.join(self.session_dir, "screenshots"), exist_ok=True)
+
+            self._asm = ScriptAssembler(self.session_dir)
             self.rec = RecorderCore(codegen=self._asm.codegen)
 
             bus.subscribe("action", self._on_action)
@@ -358,8 +385,11 @@ class RecorderApp:
             enable_shot = self.screenshot_var.get()
             enable_tpl = self.template_var.get()
             self.rec.start("android", device_serial=serial,
-                          enable_screenshot=enable_shot, enable_template=enable_tpl)
+                          enable_screenshot=enable_shot, enable_template=enable_tpl,
+                          session_dir=self.session_dir)
             self.is_recording = True
+
+            self._log(f"会话目录: {self.session_dir}", "info")
 
             parts = []
             if enable_shot: parts.append("📷截图")
@@ -395,8 +425,10 @@ class RecorderApp:
         self._log(f"脚本已生成: {script_path}", "success")
         self.status_var.set("就绪")
 
+        self.root.after(0, self._refresh_sessions)
+
         if actions:
-            self._log(f"回放: python demo_auto.py --replay", "info")
+            self._log(f"回放: 选择历史会话后点击回放按钮", "info")
 
     def _clear_actions(self):
         self.current_actions = []
@@ -431,8 +463,13 @@ class RecorderApp:
 
     # ---------- 回放 ----------
     def _start_playback(self):
-        if not os.path.exists(SCRIPT_FILE):
-            messagebox.showwarning("提示", f"找不到脚本: {SCRIPT_FILE}")
+        selected_session = self.session_var.get()
+        if selected_session:
+            script_file = os.path.join(SESSIONS_DIR, selected_session, "script.py")
+        else:
+            script_file = SCRIPT_FILE
+        if not os.path.exists(script_file):
+            messagebox.showwarning("提示", f"找不到脚本: {script_file}")
             return
         if not self.device:
             messagebox.showwarning("提示", "请先连接设备")
@@ -442,7 +479,8 @@ class RecorderApp:
         self.replay_btn.configure(state="disabled")
         self.stop_playback_btn.configure(state="normal")
         self.status_var.set("回放中...")
-        self._log(f"=== 开始回放 {SCRIPT_FILE} ===", "success")
+        self._log(f"=== 开始回放 {script_file} ===", "success")
+        self._current_script_file = script_file
         threading.Thread(target=self._do_playback, daemon=True).start()
 
     def _stop_playback(self):
@@ -478,7 +516,7 @@ class RecorderApp:
                     check_stop()
                     _time.sleep(remain)
 
-            with open(SCRIPT_FILE, encoding="utf-8") as f:
+            with open(self._current_script_file, encoding="utf-8") as f:
                 code = f.read()
 
             # Remove lines that would override our injected variables

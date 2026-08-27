@@ -5,6 +5,7 @@
   3. 坐标匹配 UI 控件 → 生成选择器优先 + 坐标兜底的 Action
 """
 from __future__ import annotations
+import os
 import re
 import time
 import threading
@@ -36,9 +37,10 @@ def _parse_value(token: str) -> int:
 
 class AndroidUiaCollector(BaseCollector):
     def __init__(self, on_event=None, device_serial: str = "", adb_path: str = "",
-                 enable_screenshot: bool = False, screenshot_dir: str = "out/screenshots",
-                 enable_template: bool = False, template_dir: str = "out/templates",
-                 template_size: int = 80, swipe_threshold: int = 30, **_):
+                 enable_screenshot: bool = False, screenshot_dir: str = "",
+                 enable_template: bool = False, template_dir: str = "",
+                 template_size: int = 120, swipe_threshold: int = 30,
+                 session_dir: str = "", **_):
         super().__init__(on_event)
         self.device_serial = device_serial
         self.adb_path = adb_path or self._find_adb()
@@ -56,10 +58,10 @@ class AndroidUiaCollector(BaseCollector):
         self._ui_cache_lock = threading.Lock()
         self._ui_cache_ts = 0.0
         self._enable_screenshot = enable_screenshot
-        self._screenshot_dir = screenshot_dir
+        self._screenshot_dir = screenshot_dir or (os.path.join(session_dir, "screenshots") if session_dir else "out/screenshots")
         self._shot_count = 0
         self._enable_template = enable_template
-        self._template_dir = template_dir
+        self._template_dir = template_dir or (os.path.join(session_dir, "templates") if session_dir else "out/templates")
         self._template_size = template_size
         self._template_count = 0
         self._swipe_threshold = swipe_threshold
@@ -341,7 +343,7 @@ class AndroidUiaCollector(BaseCollector):
         if x is None or y is None:
             return
         now = time.time()
-        if now - self._last_emit_ts < 0.3:
+        if now - self._last_emit_ts < 0.15:
             self._pending_x = self._pending_y = None
             self._touch_start_x = self._touch_start_y = None
             return
@@ -386,7 +388,8 @@ class AndroidUiaCollector(BaseCollector):
                 uia_attrs["className"] = node["class"]
 
         kind_desc = "UIA" if uia_attrs else "坐标"
-        print(f"[android] 点击: ({sx},{sy}) {kind_desc}", flush=True)
+        scale_info = f"(屏幕{self._screen_w}x{self._screen_h}, 触摸X[{self._xmin},{self._xmax}]Y[{self._ymin},{self._ymax}])"
+        print(f"[android] 点击: ({sx},{sy}) {kind_desc} {scale_info}", flush=True)
 
         action_params = {"uia": uia_attrs, "element": node or {}}
         shot_path = self._try_screenshot(sx, sy)
@@ -395,6 +398,7 @@ class AndroidUiaCollector(BaseCollector):
         template_path = self._try_template(sx, sy)
         if template_path:
             action_params["template"] = template_path
+            print(f"[android] 模板已裁剪: {template_path}", flush=True)
 
         self.emit(Action(
             type="touch",
@@ -478,19 +482,43 @@ class AndroidUiaCollector(BaseCollector):
             img = self._d.screenshot()
             if not hasattr(img, 'save'):
                 return None
-            half = self._template_size // 2
+
+            tpl_size = self._template_size
+            node = self._find_node_at(click_x, click_y)
+            if node:
+                x1, y1, x2, y2 = node.get("bounds", (0, 0, 0, 0))
+                w, h = x2 - x1, y2 - y1
+                if w > 0 and h > 0 and w <= 300 and h <= 300:
+                    tpl_size = max(w, h) + 20
+                    print(f"[android] 模板尺寸调整: {self._template_size} -> {tpl_size} (UI节点 {w}x{h})", flush=True)
+
+            half = tpl_size // 2
             x1 = max(0, click_x - half)
             y1 = max(0, click_y - half)
             x2 = min(self._screen_w, click_x + half)
             y2 = min(self._screen_h, click_y + half)
-            if x2 - x1 < 10 or y2 - y1 < 10:
+
+            if x2 - x1 < 15 or y2 - y1 < 15:
                 return None
+
             cropped = img.crop((x1, y1, x2, y2))
+
+            arr = np.array(cropped)
+            if arr.size > 0:
+                std_val = arr.std()
+                if std_val < 5:
+                    print(f"[android] 模板特征过少(std={std_val:.1f})，可能是纯色区域", flush=True)
+
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             path = os.path.join(self._template_dir, f"tpl_{self._template_count:04d}_{ts}.png")
             cropped.save(path, 'PNG')
             self._template_count += 1
-            return path
+            try:
+                rel_path = os.path.relpath(path, os.getcwd())
+            except ValueError:
+                rel_path = path
+            print(f"[android] 模板裁剪: ({click_x},{click_y}) 区域({x1},{y1})-({x2},{y2}) 尺寸{tpl_size}", flush=True)
+            return rel_path
         except Exception as e:
             print(f"[android] 模板裁剪失败: {e}", flush=True)
             return None

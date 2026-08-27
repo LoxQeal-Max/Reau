@@ -17,9 +17,14 @@ class Uia2Codegen:
         pass
 
     def emit(self, a: Action) -> str:
-        if a.type != "touch":
+        if a.type == "touch":
+            return self._gen_touch(a)
+        elif a.type == "swipe":
+            return self._gen_swipe(a)
+        else:
             return f"# 未支持: {a.type}"
 
+    def _gen_touch(self, a: Action) -> str:
         x, y = a.target.get("value", (0, 0))
         uia = a.params.get("uia") or {}
         element_def = a.params.get("element_def")
@@ -32,37 +37,59 @@ class Uia2Codegen:
             selector = self._uia_selector(uia)
             if selector:
                 return (
+                    f'print(f"点击: {selector}")\n'
                     f'try:\n'
                     f'    d({selector}).click()\n'
-                    f'except:\n'
+                    f'    print(f"  已点击")\n'
+                    f'except Exception as e:\n'
+                    f'    print(f"  选择器点击失败: {{e}}，使用坐标: ({x}, {y})")\n'
                     f'    d.click({x}, {y})'
                 )
 
         if template:
             return self._gen_by_template(template, x, y)
 
-        return f'd.click({x}, {y})'
+        return f'print(f"点击: 坐标 ({x}, {y})")\nd.click({x}, {y})'
+
+    def _gen_swipe(self, a: Action) -> str:
+        value = a.target.get("value", (0, 0, 0, 0))
+        if len(value) == 4:
+            sx, sy, ex, ey = value
+        else:
+            sx, sy, ex, ey = value[0], value[1], value[2], value[3]
+        duration = a.params.get("duration", 0.5)
+        direction = a.params.get("direction", "")
+        return (
+            f'# 滑动 ({direction}) 耗时 {duration:.2f}s\n'
+            f'd.swipe({sx}, {sy}, {ex}, {ey}, duration={duration:.2f})'
+        )
 
     @staticmethod
     def _gen_by_template(template_path: str, fallback_x: int, fallback_y: int) -> str:
+        safe_path = template_path.replace("\\", "/")
         return (
+            f'print(f"点击: 模板 {safe_path}")\n'
             f'try:\n'
-            f'    import cv2, numpy as np\n'
             f'    screen_img = np.array(d.screenshot())\n'
             f'    screen_img = cv2.cvtColor(screen_img, cv2.COLOR_RGB2BGR)\n'
-            f'    tpl = cv2.imread("{template_path}")\n'
+            f'    tpl = cv2.imread("{safe_path}")\n'
             f'    if tpl is not None:\n'
             f'        result = cv2.matchTemplate(screen_img, tpl, cv2.TM_CCOEFF_NORMED)\n'
             f'        _, conf, _, max_loc = cv2.minMaxLoc(result)\n'
+            f'        print(f"  匹配度: {{conf:.2f}}")\n'
             f'        if conf >= 0.6:\n'
             f'            th, tw = tpl.shape[:2]\n'
             f'            tx, ty = max_loc[0] + tw//2, max_loc[1] + th//2\n'
+            f'            print(f"  点击位置: ({{tx}}, {{ty}})")\n'
             f'            d.click(tx, ty)\n'
             f'        else:\n'
+            f'            print(f"  匹配度低，使用兜底坐标: ({fallback_x}, {fallback_y})")\n'
             f'            d.click({fallback_x}, {fallback_y})\n'
             f'    else:\n'
+            f'        print(f"  模板加载失败，使用兜底坐标: ({fallback_x}, {fallback_y})")\n'
             f'        d.click({fallback_x}, {fallback_y})\n'
-            f'except:\n'
+            f'except Exception as e:\n'
+            f'    print(f"  异常: {{e}}，使用兜底坐标: ({fallback_x}, {fallback_y})")\n'
             f'    d.click({fallback_x}, {fallback_y})'
         )
 

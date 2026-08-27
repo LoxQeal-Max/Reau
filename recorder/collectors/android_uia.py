@@ -354,17 +354,26 @@ class AndroidUiaCollector(BaseCollector):
             return
 
         is_swipe = False
+        is_long_press = False
+        duration = 0.0
+        
         if self._touch_start_x is not None and self._touch_start_y is not None:
             import math
             dx = sx - self._touch_start_x
             dy = sy - self._touch_start_y
             distance = math.sqrt(dx * dx + dy * dy)
             duration = now - self._touch_start_ts
-            if distance >= self._swipe_threshold and duration > 0.05:
+            
+            # 检测长按: 移动距离小且持续时间长
+            if distance < self._swipe_threshold and duration >= 0.5:
+                is_long_press = True
+            elif distance >= self._swipe_threshold and duration > 0.05:
                 is_swipe = True
 
         if is_swipe:
             self._emit_swipe(sx, sy, now)
+        elif is_long_press:
+            self._emit_long_press(sx, sy, now, duration)
         else:
             self._emit_touch(sx, sy, now)
 
@@ -402,6 +411,40 @@ class AndroidUiaCollector(BaseCollector):
 
         self.emit(Action(
             type="touch",
+            target={"kind": TargetKind.COORD, "value": (sx, sy)},
+            platform="android",
+            timestamp=now,
+            params=action_params,
+        ))
+
+    def _emit_long_press(self, sx: int, sy: int, now: float, duration: float):
+        node = self._find_node_at(sx, sy)
+        uia_attrs = {}
+        if node:
+            if node.get("text"):
+                uia_attrs["text"] = node["text"]
+            elif node.get("resource_id"):
+                rid = node["resource_id"]
+                short_rid = rid.split(":id/")[-1] if ":id/" in rid else rid
+                uia_attrs["resourceId"] = short_rid
+            elif node.get("content_desc"):
+                uia_attrs["contentDesc"] = node["content_desc"]
+            elif node.get("class"):
+                uia_attrs["className"] = node["class"]
+
+        kind_desc = "UIA" if uia_attrs else "坐标"
+        print(f"[android] 长按: ({sx},{sy}) {kind_desc} 时长={duration:.2f}s", flush=True)
+
+        action_params = {"uia": uia_attrs, "element": node or {}, "duration": duration}
+        shot_path = self._try_screenshot(sx, sy)
+        if shot_path:
+            action_params["screenshot"] = shot_path
+        template_path = self._try_template(sx, sy)
+        if template_path:
+            action_params["template"] = template_path
+
+        self.emit(Action(
+            type="long_press",
             target={"kind": TargetKind.COORD, "value": (sx, sy)},
             platform="android",
             timestamp=now,

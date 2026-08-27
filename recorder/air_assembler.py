@@ -8,6 +8,7 @@ HEADER = '''# -*- encoding=utf8 -*-
 import uiautomator2 as u2
 import cv2
 import numpy as np
+import time as _time
 
 d = u2.connect()
 
@@ -26,35 +27,38 @@ class ScriptAssembler:
         os.makedirs(output_dir, exist_ok=True)
         from .codegen import Uia2Codegen
         self.codegen = Uia2Codegen()
-        self._lines: list[tuple[str, float]] = []  # (code, timestamp)
+        self._lines: list[tuple[str, float, str]] = []  # (code, timestamp, action_type)
         self._started = False
 
-    def append(self, code_line: str, timestamp: float = 0.0):
+    def append(self, code_line: str, timestamp: float = 0.0, action_type: str = "touch"):
         if not self._started:
             self._started = True
-        self._lines.append((code_line, timestamp))
+        self._lines.append((code_line, timestamp, action_type))
 
     def build(self) -> str:
         parts = [HEADER]
         parts.append("def run():\n")
 
-        for idx, (code, ts) in enumerate(self._lines):
+        for idx, (code, ts, action_type) in enumerate(self._lines):
             parts.append("    check_stop()\n")
 
-            # Add the action code
             for l in code.split("\n"):
                 parts.append(f"    {l}\n" if l.strip() else "\n")
 
-            # Calculate sleep time before next action
             if idx < len(self._lines) - 1:
                 next_ts = self._lines[idx + 1][1]
+                next_type = self._lines[idx + 1][2]
                 if ts > 0 and next_ts > 0:
                     gap = next_ts - ts
-                    # Clamp: min 0.1s, max 3s
-                    sleep_time = max(0.1, min(3.0, gap))
+                    if action_type == "touch" and next_type == "swipe":
+                        sleep_time = max(0.5, min(3.0, gap))
+                    elif action_type == "swipe" and next_type == "touch":
+                        sleep_time = max(0.8, min(3.0, gap))
+                    else:
+                        sleep_time = max(0.3, min(3.0, gap))
                     parts.append(f"    _sleep({sleep_time:.1f})\n")
                 else:
-                    parts.append("    _sleep(1)\n")
+                    parts.append("    _sleep(1.0)\n")
 
         parts.append(FOOTER)
         content = "".join(parts)

@@ -388,7 +388,8 @@ class RecorderApp:
         self._log(f"录制结束，共 {len(actions)} 条操作", "info")
 
         for a in actions:
-            self._asm.append(self._asm.codegen.emit(a), timestamp=a.timestamp)
+            action_type = a.type if hasattr(a, 'type') else "touch"
+            self._asm.append(self._asm.codegen.emit(a), timestamp=a.timestamp, action_type=action_type)
 
         script_path = self._asm.build()
         self._log(f"脚本已生成: {script_path}", "success")

@@ -38,7 +38,7 @@ class AndroidUiaCollector(BaseCollector):
     def __init__(self, on_event=None, device_serial: str = "", adb_path: str = "",
                  enable_screenshot: bool = False, screenshot_dir: str = "out/screenshots",
                  enable_template: bool = False, template_dir: str = "out/templates",
-                 template_size: int = 80, **_):
+                 template_size: int = 80, swipe_threshold: int = 30, **_):
         super().__init__(on_event)
         self.device_serial = device_serial
         self.adb_path = adb_path or self._find_adb()
@@ -62,6 +62,10 @@ class AndroidUiaCollector(BaseCollector):
         self._template_dir = template_dir
         self._template_size = template_size
         self._template_count = 0
+        self._swipe_threshold = swipe_threshold
+        self._touch_start_x: Optional[int] = None
+        self._touch_start_y: Optional[int] = None
+        self._touch_start_ts: float = 0.0
 
     @staticmethod
     def _find_adb():
@@ -105,10 +109,14 @@ class AndroidUiaCollector(BaseCollector):
 
     def _adb_run(self, args: list, timeout: int = 10) -> Optional[str]:
         try:
+            creation_flags = 0
+            if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+                creation_flags = subprocess.CREATE_NO_WINDOW
             r = subprocess.run(
                 self._adb_base() + args,
                 capture_output=True, text=True,
-                encoding="utf-8", errors="ignore", timeout=timeout)
+                encoding="utf-8", errors="ignore", timeout=timeout,
+                creationflags=creation_flags)
             return r.stdout
         except Exception:
             return None
@@ -258,9 +266,12 @@ class AndroidUiaCollector(BaseCollector):
         cmd = self._adb_base() + ["exec-out", "getevent", "-l"]
         print(f"[android] 启动 getevent (exec-out): {' '.join(cmd)}", flush=True)
         try:
+            creation_flags = 0
+            if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+                creation_flags = subprocess.CREATE_NO_WINDOW
             self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                bufsize=0)
+                bufsize=0, creationflags=creation_flags)
         except FileNotFoundError:
             print("[android] 找不到 adb", flush=True)
             return
@@ -296,18 +307,31 @@ class AndroidUiaCollector(BaseCollector):
             print(f"[android] NO MATCH: {line}", flush=True)
             return
         dev_path, evtype, code, raw_val = m.groups()
+        # 动态学习触摸设备：游戏运行中可能切换触摸上报路径，
+        # 见到 ABS_MT_POSITION_X/Y 事件的设备即时加入白名单，避免滑动事件被丢弃
+        if evtype == "EV_ABS" and code in ("ABS_MT_POSITION_X", "ABS_MT_POSITION_Y"):
+            if dev_path not in self._touch_devices:
+                self._touch_devices.add(dev_path)
+                print(f"[android] 动态加入触摸设备: {dev_path}", flush=True)
         if self._touch_devices and dev_path not in self._touch_devices:
-            print(f"[android] FILTERED dev={dev_path} not in {self._touch_devices}", flush=True)
             return
         val = _parse_value(raw_val)
         if evtype == "EV_ABS":
             if code == "ABS_MT_TRACKING_ID":
                 if val >= 0x80000000 or val == -1:
                     self._flush_touch()
+                else:
+                    self._touch_start_x = None
+                    self._touch_start_y = None
             elif code == "ABS_MT_POSITION_X":
                 self._pending_x = val
             elif code == "ABS_MT_POSITION_Y":
                 self._pending_y = val
+                if self._touch_start_x is None and self._pending_x is not None:
+                    sx, sy = self._scale(self._pending_x, val)
+                    self._touch_start_x = sx
+                    self._touch_start_y = sy
+                    self._touch_start_ts = time.time()
         elif evtype == "EV_KEY":
             if code == "BTN_TOUCH" and val == 0:
                 self._flush_touch()
@@ -315,19 +339,38 @@ class AndroidUiaCollector(BaseCollector):
     def _flush_touch(self):
         x, y = self._pending_x, self._pending_y
         if x is None or y is None:
-            print(f"[android] flush SKIP: x={x} y={y}", flush=True)
             return
         now = time.time()
         if now - self._last_emit_ts < 0.3:
             self._pending_x = self._pending_y = None
-            print(f"[android] flush THROTTLE", flush=True)
+            self._touch_start_x = self._touch_start_y = None
             return
         sx, sy = self._scale(x, y)
         if self._screen_w and (sx < 0 or sx > self._screen_w or sy < 0 or sy > self._screen_h):
             self._pending_x = self._pending_y = None
-            print(f"[android] flush OUT_OF_BOUNDS: ({sx},{sy})", flush=True)
+            self._touch_start_x = self._touch_start_y = None
             return
 
+        is_swipe = False
+        if self._touch_start_x is not None and self._touch_start_y is not None:
+            import math
+            dx = sx - self._touch_start_x
+            dy = sy - self._touch_start_y
+            distance = math.sqrt(dx * dx + dy * dy)
+            duration = now - self._touch_start_ts
+            if distance >= self._swipe_threshold and duration > 0.05:
+                is_swipe = True
+
+        if is_swipe:
+            self._emit_swipe(sx, sy, now)
+        else:
+            self._emit_touch(sx, sy, now)
+
+        self._last_emit_ts = now
+        self._pending_x = self._pending_y = None
+        self._touch_start_x = self._touch_start_y = None
+
+    def _emit_touch(self, sx: int, sy: int, now: float):
         node = self._find_node_at(sx, sy)
         uia_attrs = {}
         if node:
@@ -343,7 +386,7 @@ class AndroidUiaCollector(BaseCollector):
                 uia_attrs["className"] = node["class"]
 
         kind_desc = "UIA" if uia_attrs else "坐标"
-        print(f"[android] 录制: ({sx},{sy}) {kind_desc} attrs={uia_attrs or '无'}", flush=True)
+        print(f"[android] 点击: ({sx},{sy}) {kind_desc}", flush=True)
 
         action_params = {"uia": uia_attrs, "element": node or {}}
         shot_path = self._try_screenshot(sx, sy)
@@ -360,8 +403,40 @@ class AndroidUiaCollector(BaseCollector):
             timestamp=now,
             params=action_params,
         ))
-        self._last_emit_ts = now
-        self._pending_x = self._pending_y = None
+
+    def _emit_swipe(self, end_x: int, end_y: int, now: float):
+        start_x = self._touch_start_x
+        start_y = self._touch_start_y
+        dx = end_x - start_x
+        dy = end_y - start_y
+        import math
+        distance = math.sqrt(dx * dx + dy * dy)
+        duration = now - self._touch_start_ts
+        direction = "down" if abs(dy) > abs(dx) else ("left" if dx < 0 else "right") if abs(dx) > abs(dy) else ("up" if dy < 0 else "down")
+
+        if abs(dx) > abs(dy):
+            direction = "left" if dx < 0 else "right"
+        else:
+            direction = "up" if dy < 0 else "down"
+
+        print(f"[android] 滑动: ({start_x},{start_y}) -> ({end_x},{end_y}) "
+              f"距离={distance:.0f}px 方向={direction} 时长={duration:.2f}s", flush=True)
+
+        action_params = {
+            "start": (start_x, start_y),
+            "end": (end_x, end_y),
+            "distance": distance,
+            "direction": direction,
+            "duration": duration,
+        }
+
+        self.emit(Action(
+            type="swipe",
+            target={"kind": TargetKind.COORD, "value": (start_x, start_y, end_x, end_y)},
+            platform="android",
+            timestamp=now,
+            params=action_params,
+        ))
 
     # ---------- 可选截图 ----------
     def _try_screenshot(self, click_x: int = 0, click_y: int = 0) -> Optional[str]:

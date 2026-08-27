@@ -5,8 +5,25 @@
   python -m gui.main
 """
 from __future__ import annotations
-import os
+
 import sys
+import subprocess as _sp
+if sys.platform == 'win32':
+    _CREATE_NO_WINDOW = 0x08000000
+    _orig_run = _sp.run
+    _orig_popen = _sp.Popen
+    def _patched_run(*args, **kwargs):
+        kwargs.setdefault('creationflags', 0)
+        kwargs['creationflags'] |= _CREATE_NO_WINDOW
+        return _orig_run(*args, **kwargs)
+    def _patched_popen(*args, **kwargs):
+        kwargs.setdefault('creationflags', 0)
+        kwargs['creationflags'] |= _CREATE_NO_WINDOW
+        return _orig_popen(*args, **kwargs)
+    _sp.run = _patched_run
+    _sp.Popen = _patched_popen
+
+import os
 import time
 import queue
 import threading
@@ -34,6 +51,7 @@ class RecorderApp:
         self.msg_queue: queue.Queue = queue.Queue()
         self.current_actions = []
         self.device = None
+        self._stop_playback_flag = threading.Event()
 
         self._set_icon()
         self._build_ui()
@@ -130,36 +148,42 @@ class RecorderApp:
         frame.pack(fill="x")
 
         self.start_btn = tk.Button(frame, text="● 开始录制", command=self._start_recording,
-                                    width=14, bg="#2d7d46", fg="white",
+                                    width=12, bg="#2d7d46", fg="white",
                                     activebackground="#236b37", activeforeground="white",
                                     relief="flat")
-        self.start_btn.pack(side="left", padx=(0, 8))
+        self.start_btn.pack(side="left", padx=(0, 6))
 
         self.stop_btn = tk.Button(frame, text="■ 结束录制", command=self._stop_recording,
-                                   width=14, bg="#c42b1c", fg="white",
+                                   width=12, bg="#c42b1c", fg="white",
                                    activebackground="#a52015", activeforeground="white",
                                    disabledforeground="white",
                                    relief="flat", state="disabled")
-        self.stop_btn.pack(side="left", padx=(0, 8))
+        self.stop_btn.pack(side="left", padx=(0, 6))
 
         self.replay_btn = tk.Button(frame, text="▶ 回放", command=self._start_playback,
-                                     width=10, bg="#1a73e8", fg="white",
+                                     width=8, bg="#1a73e8", fg="white",
                                      activebackground="#155ab6", activeforeground="white",
                                      relief="flat")
-        self.replay_btn.pack(side="left", padx=(0, 8))
+        self.replay_btn.pack(side="left", padx=(0, 6))
+
+        self.stop_playback_btn = tk.Button(frame, text="■ 停止", command=self._stop_playback,
+                                           width=8, bg="#f59e0b", fg="white",
+                                           activebackground="#d97706", activeforeground="white",
+                                           relief="flat", state="disabled")
+        self.stop_playback_btn.pack(side="left", padx=(0, 6))
 
         self.clear_btn = tk.Button(frame, text="清空", command=self._clear_actions,
-                                    width=8, relief="flat")
+                                    width=6, relief="flat")
         self.clear_btn.pack(side="left", padx=(0, 12))
 
         self.screenshot_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frame, text="录制时截图", variable=self.screenshot_var).pack(side="left")
+        ttk.Checkbutton(frame, text="录制截图", variable=self.screenshot_var).pack(side="left")
 
         self.template_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frame, text="裁剪点击模板", variable=self.template_var).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(frame, text="裁剪模板", variable=self.template_var).pack(side="left", padx=(6, 0))
 
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(frame, textvariable=self.status_var, foreground="gray").pack(side="right")
+        ttk.Label(frame, textvariable=self.status_var, foreground="gray").pack(side="right", padx=(10, 0))
 
     # ---------- 设备 ----------
     def _refresh_device(self):
@@ -285,7 +309,7 @@ class RecorderApp:
         self._log(f"录制结束，共 {len(actions)} 条操作", "info")
 
         for a in actions:
-            self._asm.append(self._asm.codegen.emit(a))
+            self._asm.append(self._asm.codegen.emit(a), timestamp=a.timestamp)
 
         script_path = self._asm.build()
         self._log(f"脚本已生成: {script_path}", "success")
@@ -302,6 +326,7 @@ class RecorderApp:
         self.current_actions.append(a)
         tgt = a.get("target", {})
         val = tgt.get("value", "")
+        action_type = a.get("type", "?")
         uia = a.get("params", {}).get("uia") or {}
         matched = a.get("params", {}).get("element_def", "")
         shot = a.get("params", {}).get("screenshot", "")
@@ -309,7 +334,17 @@ class RecorderApp:
         tag = f" [{matched}]" if matched else ""
         shot_tag = f" 📷" if shot else ""
         tpl_tag = f" 🎯" if tpl else ""
-        self._log(f"  {a.get('type', '?')} {val}{tag}{shot_tag}{tpl_tag}", "action")
+
+        if action_type == "swipe":
+            p = a.get("params", {})
+            direction = p.get("direction", "")
+            distance = p.get("distance", 0)
+            duration = p.get("duration", 0)
+            start = p.get("start", (0, 0))
+            end = p.get("end", (0, 0))
+            val = f"{start} → {end} [{direction}] {distance:.0f}px {duration:.2f}s"
+
+        self._log(f"  {action_type} {val}{tag}{shot_tag}{tpl_tag}", "action")
 
     def _on_code(self, c: dict):
         self._log(f"  → {c.get('code', '')}", "info")
@@ -323,30 +358,107 @@ class RecorderApp:
             messagebox.showwarning("提示", "请先连接设备")
             return
 
+        self._stop_playback_flag.clear()
         self.replay_btn.configure(state="disabled")
+        self.stop_playback_btn.configure(state="normal")
         self.status_var.set("▶ 回放中...")
         self._log(f"=== 开始回放 {SCRIPT_FILE} ===", "success")
         threading.Thread(target=self._do_playback, daemon=True).start()
 
+    def _stop_playback(self):
+        self._stop_playback_flag.set()
+        self._log("已发送停止指令...", "warn")
+
     def _do_playback(self):
         try:
             import uiautomator2 as u2
+            import cv2
+            import numpy as np
+            import time as _time
             serial = self.device_var.get().split("(")[-1].rstrip(")") if "(" in self.device_var.get() else ""
+            self._log(f"连接设备: {serial or '默认'}", "info")
             d = u2.connect(serial) if serial else u2.connect()
+            info = d.info
+            self._log(f"设备分辨率: {info.get('displayWidth')}x{info.get('displayHeight')}", "info")
+            self._log(f"设备: {info.get('productName', 'unknown')}", "info")
 
-            namespace = {"d": d, "__name__": "__main__", "time": __import__("time")}
+            stop_flag = self._stop_playback_flag
+
+            def check_stop():
+                if stop_flag.is_set():
+                    raise RuntimeError("STOP_PLAYBACK")
+
+            def _sleep(seconds):
+                self._log(f"等待 {seconds:.1f}s...", "info")
+                for _ in range(int(seconds / 0.1)):
+                    check_stop()
+                    _time.sleep(0.1)
+                remain = seconds - int(seconds / 0.1) * 0.1
+                if remain > 0:
+                    check_stop()
+                    _time.sleep(remain)
+
             with open(SCRIPT_FILE, encoding="utf-8") as f:
                 code = f.read()
 
-            self._log(f"脚本内容:\n{code}", "info")
-            exec(code, namespace)
-            self._log("=== 回放完成 ===", "success")
+            # Remove lines that would override our injected variables
+            lines = code.split('\n')
+            filtered_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith('import uiautomator2'):
+                    continue
+                if stripped.startswith('import cv2'):
+                    continue
+                if stripped.startswith('import numpy'):
+                    continue
+                if stripped.startswith('d = u2.connect('):
+                    continue
+                if stripped.startswith('if __name__ == "__main__"') or stripped == 'run()':
+                    continue
+                filtered_lines.append(line)
+
+            clean_code = '\n'.join(filtered_lines)
+
+            def action_log(msg):
+                self._log(str(msg), "action")
+
+            namespace = {
+                "d": d,
+                "__name__": "__main__",
+                "time": _time,
+                "_time": _time,
+                "check_stop": check_stop,
+                "_sleep": _sleep,
+                "print": action_log,
+                "cv2": cv2,
+                "np": np,
+            }
+
+            self._log("开始执行脚本...", "success")
+
+            local_ns = {}
+            exec(clean_code, namespace, local_ns)
+
+            if "run" in local_ns:
+                self._log("调用 run()...", "info")
+                local_ns["run"]()
+                self._log("=== 回放完成 ===", "success")
+            else:
+                self._log("未找到 run() 函数", "error")
+
+        except RuntimeError as e:
+            if "STOP_PLAYBACK" in str(e):
+                self._log("=== 回放已立即终止 ===", "warn")
+            else:
+                self._log(f"=== 回放异常: {e} ===", "error")
         except Exception as e:
             self._log(f"=== 回放异常: {e} ===", "error")
             import traceback
             self._log(traceback.format_exc(), "error")
         finally:
             self.replay_btn.configure(state="normal")
+            self.stop_playback_btn.configure(state="disabled")
             self.status_var.set("就绪")
 
     # ---------- 日志 ----------
@@ -376,6 +488,11 @@ class RecorderApp:
 
 
 def main():
+    try:
+        _sp.run(["adb", "start-server"], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
     root = tk.Tk()
     app = RecorderApp(root)
     root.protocol("WM_DELETE_WINDOW", root.destroy)

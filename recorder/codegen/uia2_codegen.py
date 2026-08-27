@@ -251,7 +251,7 @@ class Uia2Codegen:
             f'        # 检查模板特征是否充足\n'
             f'        tpl_gray = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)\n'
             f'        tpl_std = cv2.meanStdDev(tpl_gray)[1][0][0]\n'
-            f'        print(f"  模板特征值: {tpl_std:.1f}")\n'
+            f'        print(f"  模板特征值: {{tpl_std:.1f}}")\n'
             f'        if tpl_std < 5.0:\n'
             f'            print("  模板特征不足（纯色区域），直接使用兜底坐标")\n'
             f'            d.click({fallback_x}, {fallback_y})\n'

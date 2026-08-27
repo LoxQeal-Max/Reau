@@ -40,14 +40,15 @@ class AndroidUiaCollector(BaseCollector):
                  enable_screenshot: bool = False, screenshot_dir: str = "",
                  enable_template: bool = False, template_dir: str = "",
                  template_size: int = 120, swipe_threshold: int = 30,
-                 session_dir: str = "", **_):
+                 session_dir: str = "", device=None, **_):
         super().__init__(on_event)
         self.device_serial = device_serial
         self.adb_path = adb_path or self._find_adb()
         self._proc: Optional[subprocess.Popen] = None
         self._ge_thread: Optional[threading.Thread] = None
         self._ui_thread: Optional[threading.Thread] = None
-        self._d = None
+        self._d = device
+        self._own_device = device is None
         self._xmin = self._xmax = self._ymin = self._ymax = None
         self._screen_w = self._screen_h = 0
         self._touch_devices: set = set()
@@ -68,6 +69,7 @@ class AndroidUiaCollector(BaseCollector):
         self._touch_start_x: Optional[int] = None
         self._touch_start_y: Optional[int] = None
         self._touch_start_ts: float = 0.0
+        self._recorded_actions: list = []
 
     @staticmethod
     def _find_adb():
@@ -129,6 +131,10 @@ class AndroidUiaCollector(BaseCollector):
         self.running = True
         self._init_uiautomator2()
         self._init_scale()
+        if not self._screen_w:
+            self._screen_w = 1080
+        if not self._screen_h:
+            self._screen_h = 2520
         self._ui_thread = threading.Thread(target=self._ui_cache_loop, daemon=True)
         self._ui_thread.start()
         self._ge_thread = threading.Thread(target=self._getevent_loop, daemon=True)
@@ -137,6 +143,13 @@ class AndroidUiaCollector(BaseCollector):
     def _init_uiautomator2(self):
         import uiautomator2 as u2
         try:
+            if self._d and not self._own_device:
+                info = self._d.info
+                self._screen_w = info.get("displayWidth", 1080)
+                self._screen_h = info.get("displayHeight", 2520)
+                model = info.get("productName", "unknown")
+                print(f"[android] 使用外部设备: {model} 屏[{self._screen_w}x{self._screen_h}]", flush=True)
+                return
             if self.device_serial:
                 self._d = u2.connect(self.device_serial)
             else:
@@ -150,6 +163,7 @@ class AndroidUiaCollector(BaseCollector):
             print(f"[android] uiautomator2 连接失败: {e}", flush=True)
             self._screen_w = 1080
             self._screen_h = 2520
+            self._d = None
 
     def _init_scale(self):
         try:
@@ -277,11 +291,17 @@ class AndroidUiaCollector(BaseCollector):
         except FileNotFoundError:
             print("[android] 找不到 adb", flush=True)
             return
+        except Exception as e:
+            print(f"[android] getevent 启动失败: {e}", flush=True)
+            return
         print("[android] getevent 已启动，等待触摸...", flush=True)
         buf = b""
         line_count = 0
         while self.running:
-            chunk = self._proc.stdout.read(4096)
+            try:
+                chunk = self._proc.stdout.read(4096)
+            except Exception:
+                break
             if not chunk:
                 if self._proc.poll() is not None:
                     break
@@ -578,11 +598,13 @@ class AndroidUiaCollector(BaseCollector):
             self._ge_thread.join(timeout=3)
         if self._ui_thread:
             self._ui_thread.join(timeout=3)
-        if self._d:
+        if self._d and self._own_device:
             try:
                 self._d.disconnect()
             except Exception:
                 pass
+        actions = list(self._recorded_actions)
+        return actions
 
     def snapshot(self) -> dict:
         return {"screen": {"width": self._screen_w, "height": self._screen_h},

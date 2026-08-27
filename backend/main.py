@@ -49,6 +49,7 @@ is_playing = False
 playback_thread: Optional[threading.Thread] = None
 current_session_dir: Optional[str] = None
 ws_clients: list[WebSocket] = []
+_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 # ============ 数据模型 ============
@@ -94,21 +95,18 @@ async def broadcast_log(message: str, level: str = "info"):
 
 def log_callback(message: str, level: str = "info"):
     """日志回调 - 用于线程中调用"""
-    # 直接打印日志
     time_str = time.strftime("%H:%M:%S")
     prefix = {"info": "ℹ️", "success": "✅", "error": "❌", "warning": "⚠️"}.get(level, "ℹ️")
     print(f"[{time_str}] {prefix} {message}")
     
-    # 尝试通过事件循环广播（如果存在）
-    try:
-        loop = asyncio.get_running_loop()
-        if loop.is_running():
-            asyncio.ensure_future(broadcast_log(message, level))
-    except RuntimeError:
-        # 没有正在运行的事件循环，保存日志待后续发送
-        pass
-    except Exception:
-        pass
+    global _event_loop
+    if _event_loop and _event_loop.is_running():
+        try:
+            asyncio.run_coroutine_threadsafe(
+                broadcast_log(message, level), _event_loop
+            )
+        except Exception:
+            pass
 
 
 def get_available_sessions() -> list:
@@ -298,8 +296,12 @@ async def get_ui_elements():
 
 # ============ 录制 API ============
 
+class RecordRequest(BaseModel):
+    enable_screenshot: bool = False
+    enable_template: bool = True
+
 @app.post("/api/recording/start")
-async def start_recording():
+async def start_recording(req: RecordRequest):
     """开始录制"""
     global is_recording, collector, current_session_dir
     if is_recording:
@@ -308,29 +310,34 @@ async def start_recording():
     if not device or not device.is_connected:
         return {"error": "请先连接设备"}
     
-    current_session_dir = create_session_dir()
-    is_recording = True
-    
-    bus = EventBus()
-    collector = AndroidUiaCollector(
-        device=device._d,
-        bus=bus,
-        adb_path="",
-        output_dir=current_session_dir,
-        session_dir=current_session_dir,
-    )
-    
-    # 设置日志回调
-    original_emit = collector.emit
-    def emit_with_log(action):
-        original_emit(action)
-        log_callback(f"录制事件: {action.type} {action.target}", "info")
-    collector.emit = emit_with_log
-    
-    collector.start()
-    log_callback("开始录制...", "success")
-    
-    return {"success": True, "session_dir": current_session_dir}
+    try:
+        current_session_dir = create_session_dir()
+        is_recording = True
+        
+        bus = EventBus()
+        
+        def on_record_event(action):
+            bus.publish("action", action)
+            log_callback(f"录制事件: {action.type} {action.target}", "info")
+        
+        collector = AndroidUiaCollector(
+            on_event=on_record_event,
+            device_serial=device.serial if hasattr(device, 'serial') else "",
+            adb_path="",
+            session_dir=current_session_dir,
+            enable_screenshot=req.enable_screenshot,
+            enable_template=req.enable_template,
+            device=device._d,
+        )
+        
+        collector.start(on_record_event)
+        log_callback("开始录制...", "success")
+        
+        return {"success": True, "session_dir": current_session_dir}
+    except Exception as e:
+        is_recording = False
+        log_callback(f"启动录制失败: {e}", "error")
+        return {"error": str(e)}
 
 
 @app.post("/api/recording/stop")
@@ -341,24 +348,28 @@ async def stop_recording():
         return {"error": "没有在录制"}
     
     is_recording = False
-    actions = collector.stop()
-    log_callback(f"录制完成，共 {len(actions)} 个操作", "success")
     
-    # 生成脚本
-    if actions and current_session_dir:
-        codegen = Uia2Codegen()
-        assembler = AirAssembler()
-        script_path = os.path.join(current_session_dir, "script.py")
-        codegen.emit_to_script(actions, script_path)
-        log_callback(f"脚本已生成: {script_path}", "success")
+    try:
+        actions = collector.stop()
+        log_callback(f"录制完成，共 {len(actions)} 个操作", "success")
         
-        return {
-            "success": True,
-            "action_count": len(actions),
-            "script_path": script_path,
-        }
-    
-    return {"success": False, "message": "没有录制到操作"}
+        # 生成脚本
+        if actions and current_session_dir:
+            codegen = Uia2Codegen()
+            script_path = os.path.join(current_session_dir, "script.py")
+            codegen.emit_to_script(actions, script_path)
+            log_callback(f"脚本已生成: {script_path}", "success")
+            
+            return {
+                "success": True,
+                "action_count": len(actions),
+                "script_path": script_path,
+            }
+        
+        return {"success": True, "action_count": len(actions), "message": "没有录制到操作"}
+    except Exception as e:
+        log_callback(f"停止录制异常: {e}", "error")
+        return {"error": str(e)}
 
 
 # ============ 回放 API ============
@@ -662,6 +673,8 @@ if FRONTEND_DIR.exists():
 
 @app.on_event("startup")
 async def startup_event():
+    global _event_loop
+    _event_loop = asyncio.get_running_loop()
     log_callback("服务启动: http://localhost:8000", "success")
     
     # 启动时自动清理旧会话

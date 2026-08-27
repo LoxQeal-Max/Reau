@@ -13,6 +13,8 @@ class TargetKind(str, Enum):
 class ActionType(str, Enum):
     TOUCH = "touch"
     SWIPE = "swipe"
+    LONG_PRESS = "long_press"
+    INPUT_TEXT = "input_text"
 
 
 @dataclass

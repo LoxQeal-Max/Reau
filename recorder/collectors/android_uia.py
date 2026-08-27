@@ -40,14 +40,15 @@ class AndroidUiaCollector(BaseCollector):
                  enable_screenshot: bool = False, screenshot_dir: str = "",
                  enable_template: bool = False, template_dir: str = "",
                  template_size: int = 120, swipe_threshold: int = 30,
-                 session_dir: str = "", **_):
+                 session_dir: str = "", device=None, **_):
         super().__init__(on_event)
         self.device_serial = device_serial
         self.adb_path = adb_path or self._find_adb()
         self._proc: Optional[subprocess.Popen] = None
         self._ge_thread: Optional[threading.Thread] = None
         self._ui_thread: Optional[threading.Thread] = None
-        self._d = None
+        self._d = device
+        self._own_device = device is None
         self._xmin = self._xmax = self._ymin = self._ymax = None
         self._screen_w = self._screen_h = 0
         self._touch_devices: set = set()
@@ -68,6 +69,7 @@ class AndroidUiaCollector(BaseCollector):
         self._touch_start_x: Optional[int] = None
         self._touch_start_y: Optional[int] = None
         self._touch_start_ts: float = 0.0
+        self._recorded_actions: list = []
 
     @staticmethod
     def _find_adb():
@@ -129,6 +131,10 @@ class AndroidUiaCollector(BaseCollector):
         self.running = True
         self._init_uiautomator2()
         self._init_scale()
+        if not self._screen_w:
+            self._screen_w = 1080
+        if not self._screen_h:
+            self._screen_h = 2520
         self._ui_thread = threading.Thread(target=self._ui_cache_loop, daemon=True)
         self._ui_thread.start()
         self._ge_thread = threading.Thread(target=self._getevent_loop, daemon=True)
@@ -137,6 +143,13 @@ class AndroidUiaCollector(BaseCollector):
     def _init_uiautomator2(self):
         import uiautomator2 as u2
         try:
+            if self._d and not self._own_device:
+                info = self._d.info
+                self._screen_w = info.get("displayWidth", 1080)
+                self._screen_h = info.get("displayHeight", 2520)
+                model = info.get("productName", "unknown")
+                print(f"[android] 使用外部设备: {model} 屏[{self._screen_w}x{self._screen_h}]", flush=True)
+                return
             if self.device_serial:
                 self._d = u2.connect(self.device_serial)
             else:
@@ -150,6 +163,7 @@ class AndroidUiaCollector(BaseCollector):
             print(f"[android] uiautomator2 连接失败: {e}", flush=True)
             self._screen_w = 1080
             self._screen_h = 2520
+            self._d = None
 
     def _init_scale(self):
         try:
@@ -277,11 +291,17 @@ class AndroidUiaCollector(BaseCollector):
         except FileNotFoundError:
             print("[android] 找不到 adb", flush=True)
             return
+        except Exception as e:
+            print(f"[android] getevent 启动失败: {e}", flush=True)
+            return
         print("[android] getevent 已启动，等待触摸...", flush=True)
         buf = b""
         line_count = 0
         while self.running:
-            chunk = self._proc.stdout.read(4096)
+            try:
+                chunk = self._proc.stdout.read(4096)
+            except Exception:
+                break
             if not chunk:
                 if self._proc.poll() is not None:
                     break
@@ -354,17 +374,26 @@ class AndroidUiaCollector(BaseCollector):
             return
 
         is_swipe = False
+        is_long_press = False
+        duration = 0.0
+        
         if self._touch_start_x is not None and self._touch_start_y is not None:
             import math
             dx = sx - self._touch_start_x
             dy = sy - self._touch_start_y
             distance = math.sqrt(dx * dx + dy * dy)
             duration = now - self._touch_start_ts
-            if distance >= self._swipe_threshold and duration > 0.05:
+            
+            # 检测长按: 移动距离小且持续时间长
+            if distance < self._swipe_threshold and duration >= 0.5:
+                is_long_press = True
+            elif distance >= self._swipe_threshold and duration > 0.05:
                 is_swipe = True
 
         if is_swipe:
             self._emit_swipe(sx, sy, now)
+        elif is_long_press:
+            self._emit_long_press(sx, sy, now, duration)
         else:
             self._emit_touch(sx, sy, now)
 
@@ -402,6 +431,40 @@ class AndroidUiaCollector(BaseCollector):
 
         self.emit(Action(
             type="touch",
+            target={"kind": TargetKind.COORD, "value": (sx, sy)},
+            platform="android",
+            timestamp=now,
+            params=action_params,
+        ))
+
+    def _emit_long_press(self, sx: int, sy: int, now: float, duration: float):
+        node = self._find_node_at(sx, sy)
+        uia_attrs = {}
+        if node:
+            if node.get("text"):
+                uia_attrs["text"] = node["text"]
+            elif node.get("resource_id"):
+                rid = node["resource_id"]
+                short_rid = rid.split(":id/")[-1] if ":id/" in rid else rid
+                uia_attrs["resourceId"] = short_rid
+            elif node.get("content_desc"):
+                uia_attrs["contentDesc"] = node["content_desc"]
+            elif node.get("class"):
+                uia_attrs["className"] = node["class"]
+
+        kind_desc = "UIA" if uia_attrs else "坐标"
+        print(f"[android] 长按: ({sx},{sy}) {kind_desc} 时长={duration:.2f}s", flush=True)
+
+        action_params = {"uia": uia_attrs, "element": node or {}, "duration": duration}
+        shot_path = self._try_screenshot(sx, sy)
+        if shot_path:
+            action_params["screenshot"] = shot_path
+        template_path = self._try_template(sx, sy)
+        if template_path:
+            action_params["template"] = template_path
+
+        self.emit(Action(
+            type="long_press",
             target={"kind": TargetKind.COORD, "value": (sx, sy)},
             platform="android",
             timestamp=now,
@@ -535,11 +598,13 @@ class AndroidUiaCollector(BaseCollector):
             self._ge_thread.join(timeout=3)
         if self._ui_thread:
             self._ui_thread.join(timeout=3)
-        if self._d:
+        if self._d and self._own_device:
             try:
                 self._d.disconnect()
             except Exception:
                 pass
+        actions = list(self._recorded_actions)
+        return actions
 
     def snapshot(self) -> dict:
         return {"screen": {"width": self._screen_w, "height": self._screen_h},

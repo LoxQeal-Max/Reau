@@ -21,6 +21,10 @@ class Uia2Codegen:
             return self._gen_touch(a)
         elif a.type == "swipe":
             return self._gen_swipe(a)
+        elif a.type == "long_press":
+            return self._gen_long_press(a)
+        elif a.type == "input_text":
+            return self._gen_input_text(a)
         else:
             return f"# 未支持: {a.type}"
 
@@ -41,11 +45,12 @@ class Uia2Codegen:
         if uia:
             selector = self._uia_selector(uia)
             if selector:
+                selector_display = selector.replace('"', '\\"')
                 return (
-                    f'print(f"点击: {selector}")\n'
+                    f'print("点击: " + "{selector_display}")\n'
                     f'try:\n'
                     f'    d({selector}).click()\n'
-                    f'    print(f"  已点击")\n'
+                    f'    print("  已点击")\n'
                     f'except Exception as e:\n'
                     f'    print(f"  选择器点击失败: {{e}}，使用坐标: ({x}, {y})")\n'
                     f'    d.click({x}, {y})'
@@ -59,12 +64,13 @@ class Uia2Codegen:
     @staticmethod
     def _gen_hybrid_click(selector: str, template_path: str, fallback_x: int, fallback_y: int) -> str:
         safe_path = template_path.replace("\\", "/")
+        selector_display = selector.replace('"', '\\"')
         return (
-            f'print(f"点击: {selector} + 模板 {safe_path}")\n'
+            f'print("点击: " + "{selector_display}" + " + 模板 {safe_path}")\n'
             f'clicked = False\n'
             f'try:\n'
             f'    d({selector}).click()\n'
-            f'    print(f"  选择器点击成功")\n'
+            f'    print("  选择器点击成功")\n'
             f'    clicked = True\n'
             f'except Exception as e:\n'
             f'    print(f"  选择器点击失败: {{e}}")\n'
@@ -72,17 +78,25 @@ class Uia2Codegen:
             f'    try:\n'
             f'        tpl = cv2.imread("{safe_path}")\n'
             f'        if tpl is not None:\n'
-            f'            th, tw = tpl.shape[:2]\n'
-            f'            screen_img = np.array(d.screenshot())\n'
-            f'            screen_bgr = cv2.cvtColor(screen_img, cv2.COLOR_RGB2BGR)\n'
-            f'            result = cv2.matchTemplate(screen_bgr, tpl, cv2.TM_CCOEFF_NORMED)\n'
-            f'            _, conf, _, max_loc = cv2.minMaxLoc(result)\n'
-            f'            print(f"  模板匹配度: {{conf:.2f}}")\n'
-            f'            if conf >= 0.75:\n'
-            f'                tx, ty = max_loc[0] + tw//2, max_loc[1] + th//2\n'
-            f'                print(f"  模板定位点击: ({{tx}}, {{ty}})")\n'
-            f'                d.click(tx, ty)\n'
+            f'            # 检查模板特征\n'
+            f'            tpl_gray = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)\n'
+            f'            tpl_std = cv2.meanStdDev(tpl_gray)[1][0][0]\n'
+            f'            if tpl_std < 5.0:\n'
+            f'                print("  模板特征不足，使用兜底坐标")\n'
+            f'                d.click({fallback_x}, {fallback_y})\n'
             f'                clicked = True\n'
+            f'            else:\n'
+            f'                th, tw = tpl.shape[:2]\n'
+            f'                screen_img = np.array(d.screenshot())\n'
+            f'                screen_bgr = cv2.cvtColor(screen_img, cv2.COLOR_RGB2BGR)\n'
+            f'                result = cv2.matchTemplate(screen_bgr, tpl, cv2.TM_CCOEFF_NORMED)\n'
+            f'                _, conf, _, max_loc = cv2.minMaxLoc(result)\n'
+            f'                print(f"  模板匹配度: {{conf:.2f}}")\n'
+            f'                if conf >= 0.75:\n'
+            f'                    tx, ty = max_loc[0] + tw//2, max_loc[1] + th//2\n'
+            f'                    print(f"  模板定位点击: ({{tx}}, {{ty}})")\n'
+            f'                    d.click(tx, ty)\n'
+            f'                    clicked = True\n'
             f'    except Exception as e:\n'
             f'        print(f"  模板匹配异常: {{e}}")\n'
             f'if not clicked:\n'
@@ -114,6 +128,72 @@ class Uia2Codegen:
                 f'# 滑动 ({direction}) 耗时 {duration:.2f}s\n'
                 f'd.swipe({sx}, {sy}, {ex}, {ey}, duration={duration:.2f})'
             )
+
+    def _gen_long_press(self, a: Action) -> str:
+        x, y = a.target.get("value", (0, 0))
+        duration = a.params.get("duration", 1.0)
+        uia = a.params.get("uia") or {}
+        template = a.params.get("template", "")
+
+        if template:
+            safe_path = template.replace("\\", "/")
+            return (
+                f'print("长按: 模板 {safe_path}")\n'
+                f'try:\n'
+                f'    tpl = cv2.imread("{safe_path}")\n'
+                f'    if tpl is not None:\n'
+                f'        # 检查模板特征\n'
+                f'        tpl_gray = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)\n'
+                f'        tpl_std = cv2.meanStdDev(tpl_gray)[1][0][0]\n'
+                f'        if tpl_std < 5.0:\n'
+                f'            print("  模板特征不足，使用兜底坐标")\n'
+                f'            d.long_click({x}, {y}, duration={duration:.2f})\n'
+                f'        else:\n'
+                f'            th, tw = tpl.shape[:2]\n'
+                f'            screen_img = np.array(d.screenshot())\n'
+                f'            screen_bgr = cv2.cvtColor(screen_img, cv2.COLOR_RGB2BGR)\n'
+                f'            result = cv2.matchTemplate(screen_bgr, tpl, cv2.TM_CCOEFF_NORMED)\n'
+                f'            _, conf, _, max_loc = cv2.minMaxLoc(result)\n'
+                f'            if conf >= 0.60:\n'
+                f'                tx, ty = max_loc[0] + tw//2, max_loc[1] + th//2\n'
+                f'                print(f"  模板定位长按: ({{tx}}, {{ty}}) conf={{conf:.2f}}")\n'
+                f'                d.long_click(tx, ty, duration={duration:.2f})\n'
+                f'            else:\n'
+                f'                print(f"  匹配度过低({{conf:.2f}})，使用兜底坐标")\n'
+                f'                d.long_click({x}, {y}, duration={duration:.2f})\n'
+                f'    else:\n'
+                f'        d.long_click({x}, {y}, duration={duration:.2f})\n'
+                f'except Exception as e:\n'
+                f'    print(f"  异常: {{e}}，使用兜底坐标")\n'
+                f'    d.long_click({x}, {y}, duration={duration:.2f})'
+            )
+
+        if uia:
+            selector = self._uia_selector(uia)
+            if selector:
+                selector_display = selector.replace('"', '\\"')
+                return (
+                    f'print("长按: " + "{selector_display}")\n'
+                    f'try:\n'
+                    f'    d({selector}).long_click(duration={duration:.2f})\n'
+                    f'    print("  已长按")\n'
+                    f'except Exception as e:\n'
+                    f'    print(f"  选择器长按失败: {{e}}，使用坐标: ({x}, {y})")\n'
+                    f'    d.long_click({x}, {y}, duration={duration:.2f})'
+                )
+
+        return (
+            f'print(f"长按: 坐标 ({x}, {y}) 时长={duration:.2f}s")\n'
+            f'd.long_click({x}, {y}, duration={duration:.2f})'
+        )
+
+    def _gen_input_text(self, a: Action) -> str:
+        text = a.params.get("text", "")
+        safe_text = text.replace('"', '\\"')
+        return (
+            f'print("输入文字: {safe_text}")\n'
+            f'd.send_keys("{safe_text}")'
+        )
 
     @staticmethod
     def _gen_fast_swipe(sx: int, sy: int, ex: int, ey: int, duration: float, direction: str, distance: float) -> str:
@@ -168,34 +248,42 @@ class Uia2Codegen:
             f'        print("  模板加载失败，使用兜底坐标")\n'
             f'        d.click({fallback_x}, {fallback_y})\n'
             f'    else:\n'
-            f'        th, tw = tpl.shape[:2]\n'
-            f'        best_conf = 0.0\n'
-            f'        best_tx, best_ty = {fallback_x}, {fallback_y}\n'
-            f'        for attempt in range(3):\n'
-            f'            screen_img = np.array(d.screenshot())\n'
-            f'            screen_bgr = cv2.cvtColor(screen_img, cv2.COLOR_RGB2BGR)\n'
-            f'            result = cv2.matchTemplate(screen_bgr, tpl, cv2.TM_CCOEFF_NORMED)\n'
-            f'            _, conf, _, max_loc = cv2.minMaxLoc(result)\n'
-            f'            tx = max_loc[0] + tw // 2\n'
-            f'            ty = max_loc[1] + th // 2\n'
-            f'            print(f"  尝试{{attempt+1}}/3: 匹配度={{conf:.2f}} 位置=({{tx}},{{ty}})")\n'
-            f'            if conf > best_conf:\n'
-            f'                best_conf = conf\n'
-            f'                best_tx, best_ty = tx, ty\n'
-            f'            if conf >= 0.75:\n'
-            f'                break\n'
-            f'            if attempt < 2:\n'
-            f'                _sleep(0.2)\n'
-            f'        print(f"  最佳匹配度: {{best_conf:.2f}}")\n'
-            f'        if best_conf >= 0.75:\n'
-            f'            print(f"  模板定位点击: ({{best_tx}}, {{best_ty}})")\n'
-            f'            d.click(best_tx, best_ty)\n'
-            f'        elif best_conf >= 0.60:\n'
-            f'            print(f"  可接受匹配度，尝试点击: ({{best_tx}}, {{best_ty}})")\n'
-            f'            d.click(best_tx, best_ty)\n'
-            f'        else:\n'
-            f'            print(f"  匹配度过低，使用兜底坐标: ({fallback_x}, {fallback_y})")\n'
+            f'        # 检查模板特征是否充足\n'
+            f'        tpl_gray = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)\n'
+            f'        tpl_std = cv2.meanStdDev(tpl_gray)[1][0][0]\n'
+            f'        print(f"  模板特征值: {{tpl_std:.1f}}")\n'
+            f'        if tpl_std < 5.0:\n'
+            f'            print("  模板特征不足（纯色区域），直接使用兜底坐标")\n'
             f'            d.click({fallback_x}, {fallback_y})\n'
+            f'        else:\n'
+            f'            th, tw = tpl.shape[:2]\n'
+            f'            best_conf = 0.0\n'
+            f'            best_tx, best_ty = {fallback_x}, {fallback_y}\n'
+            f'            for attempt in range(2):\n'
+            f'                screen_img = np.array(d.screenshot())\n'
+            f'                screen_bgr = cv2.cvtColor(screen_img, cv2.COLOR_RGB2BGR)\n'
+            f'                result = cv2.matchTemplate(screen_bgr, tpl, cv2.TM_CCOEFF_NORMED)\n'
+            f'                _, conf, _, max_loc = cv2.minMaxLoc(result)\n'
+            f'                tx = max_loc[0] + tw // 2\n'
+            f'                ty = max_loc[1] + th // 2\n'
+            f'                print(f"  尝试{{attempt+1}}/2: 匹配度={{conf:.2f}}")\n'
+            f'                if conf > best_conf:\n'
+            f'                    best_conf = conf\n'
+            f'                    best_tx, best_ty = tx, ty\n'
+            f'                if conf >= 0.75:\n'
+            f'                    break\n'
+            f'                if attempt < 1:\n'
+            f'                    _sleep(0.15)\n'
+            f'            print(f"  最佳匹配度: {{best_conf:.2f}}")\n'
+            f'            if best_conf >= 0.75:\n'
+            f'                print(f"  模板定位点击: ({{best_tx}}, {{best_ty}})")\n'
+            f'                d.click(best_tx, best_ty)\n'
+            f'            elif best_conf >= 0.60:\n'
+            f'                print(f"  可接受匹配度，尝试点击: ({{best_tx}}, {{best_ty}})")\n'
+            f'                d.click(best_tx, best_ty)\n'
+            f'            else:\n'
+            f'                print(f"  匹配度过低，使用兜底坐标: ({fallback_x}, {fallback_y})")\n'
+            f'                d.click({fallback_x}, {fallback_y})\n'
             f'except Exception as e:\n'
             f'    print(f"  异常: {{e}}，使用兜底坐标: ({fallback_x}, {fallback_y})")\n'
             f'    d.click({fallback_x}, {fallback_y})'

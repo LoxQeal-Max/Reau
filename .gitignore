@@ -19,3 +19,7 @@ test_ui_*.xml
 
 # Output
 out/
+
+# Runtime files
+reau.log
+.deps_installed

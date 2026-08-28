@@ -12,9 +12,11 @@ class BaseCollector(ABC):
         self.on_event = on_event
         self.conn = conn
         self.running = False
+        self._recorded_actions: list = []
 
     def emit(self, action: Action):
         """子类采集到事件后调用此方法上抛"""
+        self._recorded_actions.append(action)
         if self.on_event and self.running:
             self.on_event(action)
 
